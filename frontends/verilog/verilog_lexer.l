@@ -280,6 +280,7 @@ static parser::symbol_type process_str(char *str, int len, bool triple, parser::
 %x SYNOPSYS_FLAGS
 %x IMPORT_DPI
 %x BASED_CONST
+%x UDP_TABLE
 
 UNSIGNED_NUMBER [0-9][0-9_]*
 FIXED_POINT_NUMBER_DEC [0-9][0-9_]*\.[0-9][0-9_]*([eE][-+]?[0-9_]+)?
@@ -390,6 +391,9 @@ TIME_SCALE_SUFFIX [munpf]?s
 "default"      { return parser::make_TOK_DEFAULT(out_loc); }
 "generate"     { return parser::make_TOK_GENERATE(out_loc); }
 "endgenerate"  { return parser::make_TOK_ENDGENERATE(out_loc); }
+"primitive"    { return parser::make_TOK_UDP_DEF(out_loc); }
+"endprimitive" { return parser::make_TOK_ENDPRIMITIVE(out_loc); }
+"table"        { BEGIN(UDP_TABLE); return parser::make_TOK_TABLE(out_loc); }
 "while"        { return parser::make_TOK_WHILE(out_loc); }
 "repeat"       { return parser::make_TOK_REPEAT(out_loc); }
 "automatic"    { return parser::make_TOK_AUTOMATIC(out_loc); }
@@ -710,6 +714,25 @@ import[ \t\r\n]+\"(DPI|DPI-C)\"[ \t\r\n]+function[ \t\r\n]+ {
 <INITIAL,BASED_CONST>"//"[^\r\n]*	/* ignore one-line comments */
 
 <INITIAL>. { return char_tok(*YYText(), out_loc); }
+
+	/* ---- UDP table lexer state ---- */
+	/* In this state we lex the body of a UDP truth table.
+	   Symbols 0/1/x/X/?/b/B/r/f/p/n/-/* are returned as ch_t.
+	   Edge specs are returned as TOK_LPAREN ... ch_t ch_t ... TOK_RPAREN.
+	   ':' and ';' are returned as COL/SEMICOL.
+	   'endtable' returns TOK_ENDTABLE and exits the state. */
+<UDP_TABLE>"endtable"   { BEGIN(0); return parser::make_TOK_ENDTABLE(out_loc); }
+<UDP_TABLE>[01xXbBrfpn?*] { return parser::make_ch_t(*YYText(), out_loc); }
+<UDP_TABLE>"-"           { return parser::make_ch_t('-', out_loc); }
+<UDP_TABLE>"("           { return parser::make_TOK_LPAREN(out_loc); }
+<UDP_TABLE>")"           { return parser::make_TOK_RPAREN(out_loc); }
+<UDP_TABLE>":"           { return parser::make_TOK_COL(out_loc); }
+<UDP_TABLE>";"           { return parser::make_TOK_SEMICOL(out_loc); }
+<UDP_TABLE>"/*"          { comment_caller=UDP_TABLE; BEGIN(COMMENT); }
+<UDP_TABLE>"//"[^\r\n]*  /* ignore line comments in UDP table */
+<UDP_TABLE>[ \t\r\n]     /* ignore whitespace in UDP table */
+<UDP_TABLE>.             { err_at_loc(out_loc, "Unexpected character '%c' in UDP table.", *YYText()); }
+
 <*>. { BEGIN(0); return char_tok(*YYText(), out_loc); }
 
 %%

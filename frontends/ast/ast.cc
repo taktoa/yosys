@@ -179,6 +179,8 @@ std::string AST::type2str(AstNodeType type)
 	X(AST_UNION)
 	X(AST_STRUCT_ITEM)
 	X(AST_BIND)
+	X(AST_UDP)
+	X(AST_UDP_ENTRY)
 #undef X
 	default:
 		log_abort();
@@ -1376,6 +1378,558 @@ static void rename_in_package_stmts(AstNode *pkg)
 			rename(item);
 }
 
+// ============================================================
+//  User-Defined Primitive (UDP) elaboration
+// ============================================================
+//
+// UDPs are converted into ordinary Verilog modules (AST_MODULE
+// nodes) so that the rest of the Yosys pipeline can handle them
+// without any further special-casing.
+//
+// UDP table entry string format (stored in AST_UDP_ENTRY::str):
+//
+//   Combinational:  "<input_syms> : <output_sym>"
+//   Sequential:     "<input_syms> : <state_sym> : <next_sym>"
+//
+// Each symbol is separated by a space; edge specs are encoded as
+// "(xy)" where x and y are the from/to state characters.
+//
+// Valid level symbols : 0  1  x  X  b  B  ?  -  *  r  f  p  n
+// Valid edge symbols  : (01) (10) (0x) (x0) (1x) (x1) etc.
+// Output symbols      : 0  1  x  X  -
+
+namespace {
+
+// Split a string by a delimiter character, returning the parts.
+static std::vector<std::string> split_str(const std::string &s, char delim)
+{
+	std::vector<std::string> result;
+	std::string cur;
+	for (char c : s) {
+		if (c == delim) {
+			result.push_back(cur);
+			cur.clear();
+		} else {
+			cur += c;
+		}
+	}
+	result.push_back(cur);
+	return result;
+}
+
+// Trim leading/trailing whitespace from a string.
+static std::string trim(const std::string &s)
+{
+	size_t a = s.find_first_not_of(" \t\r\n");
+	size_t b = s.find_last_not_of(" \t\r\n");
+	if (a == std::string::npos) return "";
+	return s.substr(a, b - a + 1);
+}
+
+// Split the input symbol list (space-separated, edge specs may contain spaces
+// inside parens) into a vector of individual symbol strings.
+static std::vector<std::string> split_input_syms(const std::string &s)
+{
+	std::vector<std::string> syms;
+	size_t i = 0;
+	std::string trimmed = trim(s);
+	while (i < trimmed.size()) {
+		if (trimmed[i] == ' ' || trimmed[i] == '\t') {
+			++i;
+		} else if (trimmed[i] == '(') {
+			// Edge spec: consume until ')'
+			size_t j = trimmed.find(')', i);
+			if (j == std::string::npos)
+				log_error("Malformed UDP edge spec in table entry: %s\n", s.c_str());
+			syms.push_back(trimmed.substr(i, j - i + 1));
+			i = j + 1;
+		} else {
+			syms.push_back(std::string(1, trimmed[i]));
+			++i;
+		}
+	}
+	return syms;
+}
+
+// Convert a UDP level symbol to RTLIL::State values for use in casex patterns.
+// Returns a list of states because 'b'/'B' expands to {S0, S1}.
+// '?' and 'x'/'X' map to Sx (don't-care in casex).
+// Returns an empty list for '*' and edge specs (caller handles those).
+static std::vector<RTLIL::State> udp_sym_to_state(char sym)
+{
+	switch (std::tolower(sym)) {
+		case '0': return {RTLIL::State::S0};
+		case '1': return {RTLIL::State::S1};
+		case 'x': return {RTLIL::State::Sx};  // casex: don't-care
+		case '?': return {RTLIL::State::Sx};  // any value: casex don't-care
+		case 'b': return {RTLIL::State::S0, RTLIL::State::S1}; // binary: two entries
+		default:  return {RTLIL::State::Sx};  // fallback
+	}
+}
+
+// Return true if the symbol string is an edge spec (e.g. "(01)", "r", "f" ...).
+static bool is_edge_sym(const std::string &sym)
+{
+	if (sym.empty()) return false;
+	if (sym[0] == '(') return true;
+	char c = std::tolower(sym[0]);
+	return (c == 'r' || c == 'f' || c == 'p' || c == 'n') && sym.size() == 1;
+}
+
+// Return true if the symbol is '*' (any value change — treated as edge).
+static bool is_any_change_sym(const std::string &sym)
+{
+	return sym == "*";
+}
+
+// Expand an edge symbol into the list of (from, to) RTLIL state pairs it covers.
+// Used to determine posedge/negedge sensitivity.
+static std::vector<std::pair<RTLIL::State,RTLIL::State>> edge_sym_to_transitions(const std::string &sym)
+{
+	using S = RTLIL::State;
+	if (sym.size() == 4 && sym[0] == '(' && sym[3] == ')') {
+		// Explicit "(ab)" notation: sym[1]=from_char, sym[2]=to_char
+		char from_c = sym[1], to_c = sym[2];
+		auto from_st = udp_sym_to_state(from_c);
+		auto to_st   = udp_sym_to_state(to_c);
+		std::vector<std::pair<S,S>> result;
+		for (auto f : from_st)
+			for (auto t : to_st)
+				result.push_back({f, t});
+		return result;
+	}
+	char c = std::tolower(sym[0]);
+	if (c == 'r')  return {{S::S0, S::S1}};
+	if (c == 'f')  return {{S::S1, S::S0}};
+	if (c == 'p')  return {{S::S0, S::S1}, {S::S0, S::Sx}, {S::Sx, S::S1}};
+	if (c == 'n')  return {{S::S1, S::S0}, {S::S1, S::Sx}, {S::Sx, S::S0}};
+	if (sym == "*") return {{S::S0,S::S1},{S::S1,S::S0},{S::S0,S::Sx},{S::Sx,S::S0},{S::S1,S::Sx},{S::Sx,S::S1}};
+	return {};
+}
+
+// Classify edge transitions: returns +1 for posedge-compatible, -1 for negedge-compatible,
+// 0 for no-vote (no clear direction), or 2 for mixed/unknown.
+// Uses "from-based" classification so that robustness entries like (0x), (x1) are
+// correctly classified as posedge, and (1x), (x0) as negedge.
+static int classify_edge_polarity(const std::vector<std::pair<RTLIL::State,RTLIL::State>> &transitions)
+{
+	using S = RTLIL::State;
+	bool has_pos = false, has_neg = false;
+	for (auto &t : transitions) {
+		if (t.first == S::S0) {
+			// from 0: posedge-compatible (0→1, 0→x both indicate rising-edge context)
+			has_pos = true;
+		} else if (t.first == S::S1) {
+			// from 1: negedge-compatible (1→0, 1→x both indicate falling-edge context)
+			has_neg = true;
+		} else {
+			// from x: use destination to disambiguate
+			if (t.second == S::S1) has_pos = true;
+			else if (t.second == S::S0) has_neg = true;
+			// (x→x) → no vote
+		}
+	}
+	if (has_pos && !has_neg) return +1;
+	if (has_neg && !has_pos) return -1;
+	if (!has_pos && !has_neg) return 0;
+	return 2; // mixed
+}
+
+
+// Create an AST_IDENTIFIER node for the given signal name.
+static std::unique_ptr<AstNode> make_id(const AstSrcLocType &loc, const std::string &name)
+{
+	auto node = std::make_unique<AstNode>(loc, AST_IDENTIFIER);
+	node->str = name;
+	return node;
+}
+
+// Create an AST constant node for a single RTLIL::State bit.
+static std::unique_ptr<AstNode> make_const_bit(const AstSrcLocType &loc, RTLIL::State val)
+{
+	return AstNode::mkconst_bits(loc, std::vector<RTLIL::State>{val}, false);
+}
+
+// Build a casex assignment statement: lhs = val (1-bit constant).
+static std::unique_ptr<AstNode> make_assign(const AstSrcLocType &loc,
+                                             const std::string &lhs_name,
+                                             char val_char)
+{
+	RTLIL::State st;
+	char c = std::tolower(val_char);
+	if (c == '0')      st = RTLIL::State::S0;
+	else if (c == '1') st = RTLIL::State::S1;
+	else               st = RTLIL::State::Sx;  // x, - (no-change handled by caller)
+
+	auto blk = std::make_unique<AstNode>(loc, AST_BLOCK);
+	auto asgn = std::make_unique<AstNode>(loc, AST_ASSIGN_EQ,
+	                                      make_id(loc, lhs_name),
+	                                      make_const_bit(loc, st));
+	asgn->children[0]->was_checked = true;
+	blk->children.push_back(std::move(asgn));
+	return blk;
+}
+
+// Build an RTLIL casex pattern constant for one entry row and a particular
+// expansion of 'b' symbols.  'b_expand' gives the values to substitute for
+// each 'b'/'B' symbol encountered (index advances through the vector).
+static RTLIL::Const pattern_for_row(const std::vector<std::string> &syms,
+                                     const std::vector<int> &b_expand)
+{
+	std::vector<RTLIL::State> bits;
+	int b_idx = 0;
+	for (auto &s : syms) {
+		char c = std::tolower(s.empty() ? '?' : s[0]);
+		if (s[0] == '(') {
+			bits.push_back(RTLIL::State::Sx);  // edge in input: don't-care
+		} else if (c == 'b') {
+			if (b_idx < (int)b_expand.size())
+				bits.push_back(b_expand[b_idx++] ? RTLIL::State::S1 : RTLIL::State::S0);
+			else
+				bits.push_back(RTLIL::State::Sx);
+		} else if (c == '0') bits.push_back(RTLIL::State::S0);
+		else if (c == '1') bits.push_back(RTLIL::State::S1);
+		else               bits.push_back(RTLIL::State::Sx);  // ?, x, *
+	}
+	std::reverse(bits.begin(), bits.end());
+	return RTLIL::Const(bits);
+}
+
+// Count the number of 'b'/'B' symbols in a symbol list.
+static int count_b_syms(const std::vector<std::string> &syms)
+{
+	int cnt = 0;
+	for (auto &s : syms)
+		if (!s.empty() && std::tolower(s[0]) == 'b')
+			++cnt;
+	return cnt;
+}
+
+
+// ---------------------------------------------------------------
+// Main UDP → Module conversion
+// ---------------------------------------------------------------
+//
+// Converts an AST_UDP node into an equivalent AST_MODULE node.
+// The caller is responsible for inserting the result into the design.
+//
+// Algorithm overview:
+//   1. Collect port info (name, sequential or not).
+//   2. Inspect table entries to detect whether any input column has
+//      edge specs (edge-sensitive sequential UDP) or not (combinational
+//      or level-sensitive).
+//   3. Build an always block:
+//        - Combinational: always @(*) begin casex({inputs}) ... endcase end
+//        - Level-sensitive: always @(*) begin casex({inputs, state}) ... end
+//        - Edge-sensitive: always @(posedge/negedge clk) begin
+//                            casex({other_inputs, state}) ... end
+//   4. Handle 'b' symbol expansion (one casex arm per expansion).
+//   5. Add a default: output = 1'bx arm.
+
+static std::unique_ptr<AstNode> convert_udp_to_module(const AstNode *udp)
+{
+	const auto &loc = udp->location;
+
+	// ---- 1. Collect information from the UDP node ----
+
+	std::string udp_name = udp->str;
+	bool is_sequential = false;
+	std::string out_name;     // e.g. "\\q"
+	std::vector<std::string> in_names; // input port names in declaration order
+	AstNode *initial_node = nullptr;  // AST_INITIAL if present
+
+	for (auto &child : udp->children) {
+		if (child->type == AST_WIRE) {
+			if (child->is_output) {
+				out_name = child->str;
+				if (child->is_reg) is_sequential = true;
+			} else if (child->is_input) {
+				in_names.push_back(child->str);
+			}
+		} else if (child->type == AST_INITIAL) {
+			initial_node = child.get();
+		}
+	}
+
+	if (out_name.empty())
+		log_file_error(*loc.begin.filename, loc.begin.line,
+		               "UDP `%s' has no output port.\n", udp_name.c_str());
+	if (in_names.empty())
+		log_file_error(*loc.begin.filename, loc.begin.line,
+		               "UDP `%s' has no input ports.\n", udp_name.c_str());
+
+	int n_inputs = (int)in_names.size();
+
+	// Count table entries
+	std::vector<const AstNode*> entries;
+	for (auto &child : udp->children)
+		if (child->type == AST_UDP_ENTRY)
+			entries.push_back(child.get());
+
+	// ---- 2. Detect edge sensitivity ----
+
+	// Check if any entry has an edge symbol in any input column.
+	int edge_col = -1;
+	for (auto *entry : entries) {
+		auto parts = split_str(entry->str, ':');
+		if (parts.empty()) continue;
+		auto syms = split_input_syms(trim(parts[0]));
+		for (int i = 0; i < (int)syms.size() && i < n_inputs; ++i) {
+			if (is_edge_sym(syms[i]) || is_any_change_sym(syms[i])) {
+				if (edge_col == -1) edge_col = i;
+			}
+		}
+	}
+
+	bool is_edge_sensitive = (edge_col != -1);
+
+	// Determine edge polarity for the clocking column
+	int edge_polarity = 0; // 0=any, +1=posedge, -1=negedge
+	if (is_edge_sensitive) {
+		// Collect all transitions on the edge column
+		std::vector<std::pair<RTLIL::State,RTLIL::State>> all_transitions;
+		bool first_entry = true;
+		int combined_pol = 0;
+		for (auto *entry : entries) {
+			auto parts = split_str(entry->str, ':');
+			if (parts.empty()) continue;
+			// Skip no-change ('-') output entries: they don't determine the active clock edge.
+			std::string out_sym = trim(parts.back());
+			if (out_sym == "-") continue;
+			auto syms = split_input_syms(trim(parts[0]));
+			if (edge_col >= (int)syms.size()) continue;
+			const auto &sym = syms[edge_col];
+			if (!is_edge_sym(sym) && !is_any_change_sym(sym)) continue;
+			auto transitions = edge_sym_to_transitions(sym);
+			int pol = classify_edge_polarity(transitions);
+			if (first_entry) { combined_pol = pol; first_entry = false; }
+			else if (combined_pol != pol) { combined_pol = 2; }
+		}
+		edge_polarity = first_entry ? 0 : combined_pol;
+	}
+
+	// ---- 3. Build the AST_MODULE node ----
+
+	auto mod = std::make_unique<AstNode>(loc, AST_MODULE);
+	mod->str = udp_name;
+
+	// Port counter for wire declarations
+	int port_cnt = 0;
+
+	// Output wire (also reg for sequential)
+	{
+		auto wire = std::make_unique<AstNode>(loc, AST_WIRE);
+		wire->str = out_name;
+		wire->is_output = true;
+		wire->port_id = ++port_cnt;
+		// Output of a UDP always drives a reg-like net (latch/FF).
+		wire->is_reg = true;
+		mod->children.push_back(std::move(wire));
+	}
+
+	// Input wires
+	for (auto &iname : in_names) {
+		auto wire = std::make_unique<AstNode>(loc, AST_WIRE);
+		wire->str = iname;
+		wire->is_input = true;
+		wire->port_id = ++port_cnt;
+		mod->children.push_back(std::move(wire));
+	}
+
+	// Initial block (for sequential UDPs with initial value)
+	if (initial_node) {
+		mod->children.push_back(initial_node->clone());
+	}
+
+	// ---- 4. Build the always block ----
+	//
+	// For combinational: sensitivity = any (AST_EDGE)
+	// For level-sensitive sequential: sensitivity = any (AST_EDGE)
+	// For edge-sensitive sequential: sensitivity = posedge/negedge of clk input
+
+	auto always = std::make_unique<AstNode>(loc, AST_ALWAYS);
+
+	if (!is_edge_sensitive) {
+		// any-change sensitivity: @(*)
+		auto sens = std::make_unique<AstNode>(loc, AST_EDGE);
+		always->children.push_back(std::move(sens));
+	} else {
+		// edge sensitivity on the clock input
+		std::string clk_name = in_names[edge_col];
+		auto clk_id = make_id(loc, clk_name);
+		if (edge_polarity == +1) {
+			// posedge
+			auto sens = std::make_unique<AstNode>(loc, AST_POSEDGE, std::move(clk_id));
+			always->children.push_back(std::move(sens));
+		} else if (edge_polarity == -1) {
+			// negedge
+			auto sens = std::make_unique<AstNode>(loc, AST_NEGEDGE, std::move(clk_id));
+			always->children.push_back(std::move(sens));
+		} else {
+			// Any edge (mixed or unknown polarity): use a plain edge sensitivity.
+			// We model it as @(posedge clk or negedge clk) by adding both.
+			auto clk_id2 = make_id(loc, clk_name);
+			auto pos_sens = std::make_unique<AstNode>(loc, AST_POSEDGE, std::move(clk_id));
+			auto neg_sens = std::make_unique<AstNode>(loc, AST_NEGEDGE, std::move(clk_id2));
+			always->children.push_back(std::move(pos_sens));
+			always->children.push_back(std::move(neg_sens));
+		}
+	}
+
+	// ---- 5. Build the casex statement ----
+	//
+	// The selector expression is a concatenation of all relevant signals.
+	// For combinational: {in[0], in[1], ..., in[N-1]}
+	// For level-sensitive sequential: {in[0], ..., in[N-1], out}  (current state = out)
+	// For edge-sensitive sequential: {in[0], ..., in[N-1] excluding edge_col, out}
+	//   (edge_col is handled by the always trigger; other inputs + state form the casex)
+
+	// Decide which signals go into the casex selector
+	std::vector<std::string> sel_signals;   // in order MSB-first for concat
+	bool include_state = is_sequential;     // state = current value of output reg
+
+	for (int i = 0; i < n_inputs; ++i) {
+		if (is_edge_sensitive && i == edge_col)
+			continue;  // clock input: handled by always trigger, not casex
+		sel_signals.push_back(in_names[i]);
+	}
+	if (include_state) {
+		sel_signals.push_back(out_name);  // current state is the output register value
+	}
+
+	int sel_width = (int)sel_signals.size();
+
+	// Build the selector: concatenation or single signal
+	std::unique_ptr<AstNode> sel_expr;
+	if (sel_width == 0) {
+		// No inputs at all: generate constant 1'b0 selector (degenerate)
+		sel_expr = AstNode::mkconst_int(loc, 0, false, 1);
+	} else if (sel_width == 1) {
+		sel_expr = make_id(loc, sel_signals[0]);
+	} else {
+		sel_expr = std::make_unique<AstNode>(loc, AST_CONCAT);
+		// AST_CONCAT children are appended; first child = MSB
+		for (auto &sig : sel_signals)
+			sel_expr->children.push_back(make_id(loc, sig));
+	}
+
+	// Create casex node
+	auto casex_node = std::make_unique<AstNode>(loc, AST_CASE, std::move(sel_expr));
+	// Mark as casex by setting the attribute (simplify uses case_type_stack during
+	// parsing; here we must tag the children as CONDX to achieve casex semantics).
+
+	// ---- 6. Add one casex arm per table entry ----
+	//
+	// For each UDP table entry, build the casex pattern and output assignment.
+	// Handle 'b' expansion by iterating over all combinations.
+	// Skip 'no-change' ('-') entries for edge-sensitive UDPs (the FF holds by default).
+
+	for (auto *entry : entries) {
+		auto parts = split_str(entry->str, ':');
+		if ((int)parts.size() < 2) continue;
+
+		// Parse symbols
+		auto all_input_syms = split_input_syms(trim(parts[0]));
+		std::string state_sym_str, out_sym_str;
+		if (parts.size() == 3) {
+			// Sequential entry: inputs : state : output
+			state_sym_str = trim(parts[1]);
+			out_sym_str   = trim(parts[2]);
+		} else {
+			// Combinational entry: inputs : output
+			out_sym_str = trim(parts[1]);
+		}
+
+		char out_sym = out_sym_str.empty() ? 'x' : out_sym_str[0];
+
+		// Skip "no-change" entries: they represent the register holding its value,
+		// which is the default behavior (no assignment needed in casex).
+		if (std::tolower(out_sym) == '-')
+			continue;
+
+		// Build the selector symbol list (mirrors sel_signals above)
+		std::vector<std::string> pat_syms;
+		for (int i = 0; i < n_inputs; ++i) {
+			if (is_edge_sensitive && i == edge_col)
+				continue;
+			std::string sym_str;
+			if (i < (int)all_input_syms.size())
+				sym_str = all_input_syms[i];
+			else
+				sym_str = "?";
+			pat_syms.push_back(sym_str);
+		}
+		if (include_state && !state_sym_str.empty()) {
+			pat_syms.push_back(state_sym_str);
+		} else if (include_state) {
+			pat_syms.push_back("?");
+		}
+
+		// If edge_col row had a non-edge symbol in this entry (e.g. a level
+		// symbol like '?' or '0'), the entry is not triggered by the always
+		// edge sensitivity, so skip it (it fires on level, not edge).
+		if (is_edge_sensitive) {
+			std::string clk_sym;
+			if (edge_col < (int)all_input_syms.size())
+				clk_sym = all_input_syms[edge_col];
+			if (!clk_sym.empty() && !is_edge_sym(clk_sym) && !is_any_change_sym(clk_sym)) {
+				// This entry fires on a level of the clock, not an edge.
+				// For edge-sensitive UDPs, these are typically "no-change" rows
+				// (output='-') which we already skipped above.  Any remaining
+				// level-clk entry with a defined output is unusual; skip it
+				// to avoid adding spurious logic.
+				continue;
+			}
+		}
+
+		// Expand 'b' symbols: iterate over 2^n_b combinations
+		int n_b = count_b_syms(pat_syms);
+		int n_combos = (1 << n_b);
+
+		for (int combo = 0; combo < n_combos; ++combo) {
+			// Build the expansion vector for this combo
+			std::vector<int> b_expand;
+			for (int k = 0; k < n_b; ++k)
+				b_expand.push_back((combo >> (n_b - 1 - k)) & 1);
+
+			RTLIL::Const pattern = pattern_for_row(pat_syms, b_expand);
+
+			auto cond = std::make_unique<AstNode>(loc, AST_CONDX);
+			cond->children.push_back(AstNode::mkconst_bits(loc, pattern.to_bits(), false));
+			cond->children.push_back(make_assign(loc, out_name, out_sym));
+			casex_node->children.push_back(std::move(cond));
+		}
+	}
+
+	// ---- 7. Add default casex arm ----
+	//
+	// For combinational UDPs: default is output = 1'bx.
+	// For sequential UDPs: default is "no change" (no assignment → register holds).
+	// We always add a default = x for combinational so that undefined inputs
+	// produce x output (correct per IEEE 1364).
+
+	if (!is_sequential) {
+		// Combinational: default output = x
+		auto def_cond = std::make_unique<AstNode>(loc, AST_CONDX);
+		def_cond->children.push_back(std::make_unique<AstNode>(loc, AST_DEFAULT));
+		def_cond->children.push_back(make_assign(loc, out_name, 'x'));
+		casex_node->children.push_back(std::move(def_cond));
+	}
+	// For sequential UDPs, omitting the default lets the register hold its value
+	// (which is the correct "no change" semantics for sequential UDPs).
+
+	// ---- 8. Wrap casex in an always block ----
+
+	auto block = std::make_unique<AstNode>(loc, AST_BLOCK);
+	block->children.push_back(std::move(casex_node));
+	always->children.push_back(std::move(block));
+	mod->children.push_back(std::move(always));
+
+	return mod;
+}
+
+} // anonymous namespace
+
 // create AstModule instances for all modules in the AST tree and add them to 'design'
 void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump_ast1, bool dump_ast2, bool no_dump_ptr, bool dump_vlog1, bool dump_vlog2, bool dump_rtlil,
 		bool nolatches, bool nomeminit, bool nomem2reg, bool mem2reg, bool noblackbox, bool lib, bool nowb, bool noopt, bool icells, bool pwires, bool nooverwrite, bool overwrite, bool defer, bool autowire)
@@ -1470,6 +2024,30 @@ void AST::process(RTLIL::Design *design, AstNode *ast, bool nodisplay, bool dump
 			rename_in_package_stmts(child.get());
 			design->verilog_packages.push_back(child->clone());
 			current_scope.clear();
+		}
+		else if (child->type == AST_UDP) {
+			// Convert the UDP to an equivalent AST_MODULE and process it.
+			auto mod_ast = convert_udp_to_module(child.get());
+
+			if (design->has(mod_ast->str)) {
+				RTLIL::Module *existing_mod = design->module(mod_ast->str);
+				if (!nooverwrite && !overwrite && !existing_mod->get_blackbox_attribute()) {
+					log_file_error(*child->location.begin.filename, child->location.begin.line,
+					               "Re-definition of module `%s'!\n", mod_ast->str.c_str());
+				} else if (nooverwrite) {
+					log("Ignoring re-definition of module `%s' at %s.\n",
+					        mod_ast->str.c_str(), child->loc_string().c_str());
+					continue;
+				} else {
+					log("Replacing existing%s module `%s' at %s.\n",
+					        existing_mod->get_bool_attribute(ID::blackbox) ? " blackbox" : "",
+					        mod_ast->str.c_str(), child->loc_string().c_str());
+					design->remove(existing_mod);
+				}
+			}
+
+			process_module(design, mod_ast.get(), false);
+			current_ast_mod = nullptr;
 		}
 		else if (child->type == AST_BIND) {
 			// top-level bind construct

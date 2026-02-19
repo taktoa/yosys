@@ -161,7 +161,11 @@ namespace AST
 		AST_STRUCT,
 		AST_UNION,
 		AST_STRUCT_ITEM,
-		AST_BIND
+		AST_BIND,
+
+		// User-Defined Primitive (UDP) nodes
+		AST_UDP,        // UDP definition (like AST_MODULE but for primitives)
+		AST_UDP_ENTRY   // one row in a UDP truth table
 	};
 
 	using AstSrcLocType = Location;

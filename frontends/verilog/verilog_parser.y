@@ -512,6 +512,7 @@
 %token TOK_SHL_ASSIGN TOK_SHR_ASSIGN TOK_SSHL_ASSIGN TOK_SSHR_ASSIGN
 %token TOK_BIND TOK_TIME_SCALE
 %token TOK_IMPORT
+%token TOK_UDP_DEF TOK_ENDPRIMITIVE TOK_TABLE TOK_ENDTABLE
 
 %token TOK_EXCL "'!'"
 %token TOK_HASH "'#'"
@@ -564,6 +565,10 @@
 %type <ast_t> specify_if specify_condition
 %type <ch_t> specify_edge
 
+/* UDP-related types */
+%type <string_t> udp_input_sym_list udp_input_sym
+%type <ch_t> udp_level_sym udp_output_sym
+
 // operator precedence from low to high
 %left OP_LOR
 %left OP_LAND
@@ -611,6 +616,7 @@ design:
 	import_stmt design |
 	interface design |
 	bind_directive design |
+	primitive_decl design |
 	%empty;
 
 attr:
@@ -713,6 +719,145 @@ module:
 		extra->current_ast_mod = nullptr;
 		extra->exitTypeScope();
 	};
+
+/* -------- User-Defined Primitive (UDP) support -------- */
+
+primitive_decl:
+	attr TOK_UDP_DEF {
+		extra->enterTypeScope();
+	} TOK_ID {
+		extra->do_not_require_port_stubs = false;
+		AstNode* udp = extra->pushChild(std::make_unique<AstNode>(@$, AST_UDP));
+		extra->current_ast_mod = udp;
+		extra->port_stubs.clear();
+		extra->port_counter = 0;
+		udp->str = *$4;
+		append_attr(udp, std::move($1));
+	} TOK_LPAREN udp_port_list TOK_RPAREN TOK_SEMICOL
+	  udp_port_decls
+	  udp_optional_initial
+	  TOK_TABLE udp_table_entries TOK_ENDTABLE
+	  TOK_ENDPRIMITIVE {
+		SET_AST_NODE_LOC(extra->ast_stack.back(), @2, @$);
+		extra->ast_stack.pop_back();
+		log_assert(extra->ast_stack.size() == 1);
+		extra->current_ast_mod = nullptr;
+		extra->exitTypeScope();
+	};
+
+/* Port list in the primitive header: just collects names */
+udp_port_list:
+	TOK_ID {
+		extra->port_stubs[*$1] = 0;
+	} |
+	udp_port_list TOK_COMMA TOK_ID {
+		extra->port_stubs[*$3] = 0;
+	};
+
+/* Port declarations in the primitive body */
+udp_port_decls:
+	udp_port_decls udp_port_decl |
+	%empty;
+
+udp_port_decl:
+	/* output port (combinational): output out_name ; */
+	TOK_OUTPUT TOK_ID TOK_SEMICOL {
+		auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
+		wire->str = "\\" + *$2;
+		wire->is_output = true;
+		wire->port_id = ++extra->port_counter;
+		extra->ast_stack.back()->children.push_back(std::move(wire));
+	} |
+	/* output reg port (sequential): output reg out_name ; */
+	TOK_OUTPUT TOK_REG TOK_ID TOK_SEMICOL {
+		auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
+		wire->str = "\\" + *$3;
+		wire->is_output = true;
+		wire->is_reg = true;
+		wire->port_id = ++extra->port_counter;
+		extra->ast_stack.back()->children.push_back(std::move(wire));
+	} |
+	/* input port(s): input a, b, c ; */
+	TOK_INPUT udp_input_decl_list TOK_SEMICOL;
+
+udp_input_decl_list:
+	udp_input_decl_list TOK_COMMA TOK_ID {
+		auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
+		wire->str = "\\" + *$3;
+		wire->is_input = true;
+		wire->port_id = ++extra->port_counter;
+		extra->ast_stack.back()->children.push_back(std::move(wire));
+	} |
+	TOK_ID {
+		auto wire = std::make_unique<AstNode>(@$, AST_WIRE);
+		wire->str = "\\" + *$1;
+		wire->is_input = true;
+		wire->port_id = ++extra->port_counter;
+		extra->ast_stack.back()->children.push_back(std::move(wire));
+	};
+
+/* Optional initial statement for sequential UDPs: initial out = 1'b0; */
+udp_optional_initial:
+	TOK_INITIAL TOK_ID TOK_EQ expr TOK_SEMICOL {
+		auto init = std::make_unique<AstNode>(@$, AST_INITIAL);
+		auto block = std::make_unique<AstNode>(@$, AST_BLOCK);
+		auto id = std::make_unique<AstNode>(@$, AST_IDENTIFIER);
+		id->str = "\\" + *$2;
+		auto asgn = std::make_unique<AstNode>(@$, AST_ASSIGN_EQ, std::move(id), std::move($4));
+		block->children.push_back(std::move(asgn));
+		init->children.push_back(std::move(block));
+		extra->ast_stack.back()->children.push_back(std::move(init));
+	} |
+	%empty;
+
+/* Zero or more table entries */
+udp_table_entries:
+	udp_table_entries udp_table_entry |
+	%empty;
+
+/* One table entry row */
+udp_table_entry:
+	/* Combinational: sym sym ... : output_sym ; */
+	udp_input_sym_list TOK_COL udp_output_sym TOK_SEMICOL {
+		auto entry = std::make_unique<AstNode>(@$, AST_UDP_ENTRY);
+		entry->str = *$1 + " : " + std::string(1, $3);
+		extra->ast_stack.back()->children.push_back(std::move(entry));
+	} |
+	/* Sequential: sym sym ... : state_sym : next_sym ; */
+	udp_input_sym_list TOK_COL udp_level_sym TOK_COL udp_output_sym TOK_SEMICOL {
+		auto entry = std::make_unique<AstNode>(@$, AST_UDP_ENTRY);
+		entry->str = *$1 + " : " + std::string(1, $3) + " : " + std::string(1, $5);
+		extra->ast_stack.back()->children.push_back(std::move(entry));
+	};
+
+/* List of input symbols for one table row; returns space-separated string */
+udp_input_sym_list:
+	udp_input_sym {
+		$$ = std::make_unique<std::string>(*$1);
+	} |
+	udp_input_sym_list udp_input_sym {
+		$$ = std::make_unique<std::string>(*$1 + " " + *$2);
+	};
+
+/* One input symbol (level or edge) */
+udp_input_sym:
+	udp_level_sym {
+		$$ = std::make_unique<std::string>(std::string(1, $1));
+	} |
+	/* Explicit edge: (from_sym to_sym) */
+	TOK_LPAREN ch_t ch_t TOK_RPAREN {
+		$$ = std::make_unique<std::string>(std::string("(") + $2 + $3 + ")");
+	};
+
+/* A single level symbol (in input or state column) */
+udp_level_sym:
+	ch_t { $$ = $1; };
+
+/* Output / next-state symbol (may include - for no-change) */
+udp_output_sym:
+	ch_t { $$ = $1; };
+
+/* -------- End of UDP support -------- */
 
 module_para_opt:
 	TOK_HASH TOK_LPAREN module_para_list TOK_RPAREN | %empty;
