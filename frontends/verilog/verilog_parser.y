@@ -2451,7 +2451,18 @@ single_cell_no_array:
 		log_assert(extra->cell_hack);
 		SET_AST_NODE_LOC(extra->cell_hack, @1, @$);
 		extra->cell_hack = nullptr;
-	}
+	} |
+	/* nameless instantiation */ {
+		extra->astbuf2 = extra->astbuf1->clone();
+		if (extra->astbuf2->type != AST_PRIMITIVE)
+			extra->astbuf2->str = "$unnamed_cell$" + std::to_string(autoidx++);
+		extra->cell_hack = extra->astbuf2.get();
+		extra->ast_stack.back()->children.push_back(std::move(extra->astbuf2));
+	} TOK_LPAREN cell_port_list TOK_RPAREN {
+		log_assert(extra->cell_hack);
+		SET_AST_NODE_LOC(extra->cell_hack, @1, @$);
+		extra->cell_hack = nullptr;
+	};
 
 single_cell_arraylist:
 	TOK_ID non_opt_range {
@@ -2461,7 +2472,22 @@ single_cell_arraylist:
 		// TODO optimize again
 		extra->cell_hack = extra->astbuf2.get();
 		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_CELLARRAY, std::move($2), std::move(extra->astbuf2)));
-	} TOK_LPAREN cell_port_list TOK_RPAREN{
+	} TOK_LPAREN cell_port_list TOK_RPAREN {
+		log_assert(extra->cell_hack);
+		SET_AST_NODE_LOC(extra->cell_hack, @1, @$);
+		extra->cell_hack = nullptr;
+	} |
+	/* nameless array instantiation */
+	non_opt_range {
+		extra->astbuf2 = extra->astbuf1->clone();
+		if (extra->astbuf2->type != AST_PRIMITIVE)
+			extra->astbuf2->str = "$unnamed_cell$" + std::to_string(autoidx++);
+
+		extra->cell_hack = extra->astbuf2.get();
+
+		// Note: We use $1 here instead of $2 because non_opt_range is now the first token in this branch
+		extra->ast_stack.back()->children.push_back(std::make_unique<AstNode>(@$, AST_CELLARRAY, std::move($1), std::move(extra->astbuf2)));
+	} TOK_LPAREN cell_port_list TOK_RPAREN {
 		log_assert(extra->cell_hack);
 		SET_AST_NODE_LOC(extra->cell_hack, @1, @$);
 		extra->cell_hack = nullptr;
@@ -2476,18 +2502,7 @@ prim_list:
 	prim_list TOK_COMMA single_prim;
 
 single_prim:
-	single_cell |
-	/* no name */ {
-		extra->astbuf2 = extra->astbuf1->clone();
-		log_assert(!extra->cell_hack);
-		extra->cell_hack = extra->astbuf2.get();
-		// TODO optimize again
-		extra->ast_stack.back()->children.push_back(std::move(extra->astbuf2));
-	} TOK_LPAREN cell_port_list TOK_RPAREN {
-		log_assert(extra->cell_hack);
-		SET_AST_NODE_LOC(extra->cell_hack, @1, @$);
-		extra->cell_hack = nullptr;
-	}
+	single_cell;
 
 cell_parameter_list_opt:
 	TOK_HASH TOK_LPAREN cell_parameter_list TOK_RPAREN | %empty;
