@@ -1451,19 +1451,23 @@ static std::vector<std::string> split_input_syms(const std::string &s)
 	return syms;
 }
 
-// Convert a UDP level symbol to RTLIL::State values for use in casex patterns.
-// Returns a list of states because 'b'/'B' expands to {S0, S1}.
-// '?' and 'x'/'X' map to Sx (don't-care in casex).
-// Returns an empty list for '*' and edge specs (caller handles those).
+// Convert a UDP level symbol to the set of RTLIL::State values it can match.
+// We use AST_COND (case-equality, ===) so each State matches exactly itself:
+//   '0' -> {S0}          exact match for logic 0
+//   '1' -> {S1}          exact match for logic 1
+//   'x' -> {Sx}          exact match for unknown (x)
+//   'b' -> {S0, S1}      0 or 1 (not x)
+//   '?' -> {S0, S1, Sx}  any of 0, 1, x
+// Returns an empty list for edge specs and unknowns (caller handles those).
 static std::vector<RTLIL::State> udp_sym_to_state(char sym)
 {
 	switch (std::tolower(sym)) {
 		case '0': return {RTLIL::State::S0};
 		case '1': return {RTLIL::State::S1};
-		case 'x': return {RTLIL::State::Sx};  // casex: don't-care
-		case '?': return {RTLIL::State::Sx};  // any value: casex don't-care
-		case 'b': return {RTLIL::State::S0, RTLIL::State::S1}; // binary: two entries
-		default:  return {RTLIL::State::Sx};  // fallback
+		case 'x': return {RTLIL::State::Sx};
+		case 'b': return {RTLIL::State::S0, RTLIL::State::S1};
+		case '?': return {RTLIL::State::S0, RTLIL::State::S1, RTLIL::State::Sx};
+		default:  return {RTLIL::State::Sx};
 	}
 }
 
@@ -1570,39 +1574,43 @@ static std::unique_ptr<AstNode> make_assign(const AstSrcLocType &loc,
 	return blk;
 }
 
-// Build an RTLIL casex pattern constant for one entry row and a particular
-// expansion of 'b' symbols.  'b_expand' gives the values to substitute for
-// each 'b'/'B' symbol encountered (index advances through the vector).
-static RTLIL::Const pattern_for_row(const std::vector<std::string> &syms,
-                                     const std::vector<int> &b_expand)
+// Expand a row of UDP symbols into all concrete RTLIL::Const patterns by
+// computing the Cartesian product of each column's possible states.
+// Edge-spec columns (e.g. "(01)") should already have been excluded by the
+// caller; any remaining '(' prefix is treated as '?' (unknown).
+static std::vector<RTLIL::Const> expand_row_patterns(const std::vector<std::string> &syms)
 {
-	std::vector<RTLIL::State> bits;
-	int b_idx = 0;
+	// Build the state set for each column.
+	std::vector<std::vector<RTLIL::State>> col_states;
+	col_states.reserve(syms.size());
 	for (auto &s : syms) {
-		char c = std::tolower(s.empty() ? '?' : s[0]);
-		if (s[0] == '(') {
-			bits.push_back(RTLIL::State::Sx);  // edge in input: don't-care
-		} else if (c == 'b') {
-			if (b_idx < (int)b_expand.size())
-				bits.push_back(b_expand[b_idx++] ? RTLIL::State::S1 : RTLIL::State::S0);
-			else
-				bits.push_back(RTLIL::State::Sx);
-		} else if (c == '0') bits.push_back(RTLIL::State::S0);
-		else if (c == '1') bits.push_back(RTLIL::State::S1);
-		else               bits.push_back(RTLIL::State::Sx);  // ?, x, *
+		char c = (s.empty() || s[0] == '(') ? '?' : std::tolower(s[0]);
+		col_states.push_back(udp_sym_to_state(c));
 	}
-	std::reverse(bits.begin(), bits.end());
-	return RTLIL::Const(bits);
-}
 
-// Count the number of 'b'/'B' symbols in a symbol list.
-static int count_b_syms(const std::vector<std::string> &syms)
-{
-	int cnt = 0;
-	for (auto &s : syms)
-		if (!s.empty() && std::tolower(s[0]) == 'b')
-			++cnt;
-	return cnt;
+	// Iterative Cartesian product: start with one empty row, extend column by column.
+	std::vector<std::vector<RTLIL::State>> rows = {{}};
+	for (auto &col : col_states) {
+		std::vector<std::vector<RTLIL::State>> next;
+		next.reserve(rows.size() * col.size());
+		for (auto &row : rows) {
+			for (auto st : col) {
+				next.push_back(row);
+				next.back().push_back(st);
+			}
+		}
+		rows = std::move(next);
+	}
+
+	// Convert each concrete row to an RTLIL::Const (LSB-first, so reverse).
+	std::vector<RTLIL::Const> result;
+	result.reserve(rows.size());
+	for (auto &row : rows) {
+		auto bits = row;
+		std::reverse(bits.begin(), bits.end());
+		result.push_back(RTLIL::Const(bits));
+	}
+	return result;
 }
 
 
@@ -1619,11 +1627,14 @@ static int count_b_syms(const std::vector<std::string> &syms)
 //      edge specs (edge-sensitive sequential UDP) or not (combinational
 //      or level-sensitive).
 //   3. Build an always block:
-//        - Combinational: always @(*) begin casex({inputs}) ... endcase end
-//        - Level-sensitive: always @(*) begin casex({inputs, state}) ... end
-//        - Edge-sensitive: always @(posedge/negedge clk) begin
-//                            casex({other_inputs, state}) ... end
-//   4. Handle 'b' symbol expansion (one casex arm per expansion).
+//        - Combinational:    always @(*) begin case({inputs}) ... endcase end
+//        - Level-sensitive:  always @(*) begin case({inputs, state}) ... end
+//        - Edge-sensitive:   always @(posedge/negedge clk) begin
+//                              case({other_inputs, state}) ... end
+//      The case arms use AST_COND (case-equality, ===) so that 'x' in a
+//      pattern matches only 'x', not "any value".
+//   4. Expand multi-valued symbols ('?'->{0,1,x}, 'b'->{0,1}) via Cartesian
+//      product to generate one literal AST_COND arm per concrete pattern.
 //   5. Add a default: output = 1'bx arm.
 
 static std::unique_ptr<AstNode> convert_udp_to_module(const AstNode *udp)
@@ -1813,10 +1824,11 @@ static std::unique_ptr<AstNode> convert_udp_to_module(const AstNode *udp)
 			sel_expr->children.push_back(make_id(loc, sig));
 	}
 
-	// Create casex node
+	// Create case node (using case-equality / === semantics via AST_COND children).
+	// Each column's multi-valued symbols ('?', 'b') are pre-expanded into separate
+	// concrete patterns by expand_row_patterns(), so AST_COND (not CONDX) is correct:
+	// Sx in a pattern matches exactly x, not "any value".
 	auto casex_node = std::make_unique<AstNode>(loc, AST_CASE, std::move(sel_expr));
-	// Mark as casex by setting the attribute (simplify uses case_type_stack during
-	// parsing; here we must tag the children as CONDX to achieve casex semantics).
 
 	// ---- 6. Add one casex arm per table entry ----
 	//
@@ -1882,19 +1894,10 @@ static std::unique_ptr<AstNode> convert_udp_to_module(const AstNode *udp)
 			}
 		}
 
-		// Expand 'b' symbols: iterate over 2^n_b combinations
-		int n_b = count_b_syms(pat_syms);
-		int n_combos = (1 << n_b);
-
-		for (int combo = 0; combo < n_combos; ++combo) {
-			// Build the expansion vector for this combo
-			std::vector<int> b_expand;
-			for (int k = 0; k < n_b; ++k)
-				b_expand.push_back((combo >> (n_b - 1 - k)) & 1);
-
-			RTLIL::Const pattern = pattern_for_row(pat_syms, b_expand);
-
-			auto cond = std::make_unique<AstNode>(loc, AST_CONDX);
+		// Expand each column's symbol set and emit one AST_COND arm per
+		// concrete pattern in the Cartesian product.
+		for (auto &pattern : expand_row_patterns(pat_syms)) {
+			auto cond = std::make_unique<AstNode>(loc, AST_COND);
 			cond->children.push_back(AstNode::mkconst_bits(loc, pattern.to_bits(), false));
 			cond->children.push_back(make_assign(loc, out_name, out_sym));
 			casex_node->children.push_back(std::move(cond));
@@ -1910,7 +1913,7 @@ static std::unique_ptr<AstNode> convert_udp_to_module(const AstNode *udp)
 
 	if (!is_sequential) {
 		// Combinational: default output = x
-		auto def_cond = std::make_unique<AstNode>(loc, AST_CONDX);
+		auto def_cond = std::make_unique<AstNode>(loc, AST_COND);
 		def_cond->children.push_back(std::make_unique<AstNode>(loc, AST_DEFAULT));
 		def_cond->children.push_back(make_assign(loc, out_name, 'x'));
 		casex_node->children.push_back(std::move(def_cond));
